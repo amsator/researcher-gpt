@@ -1,4 +1,6 @@
 import os
+import logging
+import asyncio
 from dotenv import load_dotenv
 
 from langchain import PromptTemplate
@@ -17,10 +19,13 @@ import requests
 import json
 from langchain.schema import SystemMessage
 from fastapi import FastAPI
+from fastapi.concurrency import run_in_threadpool
 
 load_dotenv()
-brwoserless_api_key = os.getenv("BROWSERLESS_API_KEY")
-serper_api_key = os.getenv("SERP_API_KEY")
+browserless_api_key = os.getenv("BROWSERLESS_API_KEY")
+serp_api_key = os.getenv("SERP_API_KEY")
+logging.basicConfig(level=logging.INFO)
+TESTING = os.getenv("UNIT_TEST") == "1"
 
 # 1. Tool for search
 
@@ -33,23 +38,24 @@ def search(query):
     })
 
     headers = {
-        'X-API-KEY': serper_api_key,
+        'X-API-KEY': serp_api_key,
         'Content-Type': 'application/json'
     }
 
-    response = requests.request("POST", url, headers=headers, data=payload)
-
-    print(response.text)
-
-    return response.text
+    try:
+        response = requests.post(url, headers=headers, data=payload, timeout=10)
+        response.raise_for_status()
+        return response.text
+    except requests.RequestException as e:
+        logging.error("Search request failed: %s", e)
+        return f"Search request failed: {e}"
 
 
 # 2. Tool for scraping
 def scrape_website(objective: str, url: str):
-    # scrape website, and also will summarize the content based on objective if the content is too large
-    # objective is the original objective & task that user give to the agent, url is the url of the website to be scraped
+    """Scrape a website and optionally summarize the content."""
 
-    print("Scraping website...")
+    logging.info("Scraping website %s", url)
     # Define the headers for the request
     headers = {
         'Cache-Control': 'no-cache',
@@ -65,22 +71,22 @@ def scrape_website(objective: str, url: str):
     data_json = json.dumps(data)
 
     # Send the POST request
-    post_url = f"https://chrome.browserless.io/content?token={brwoserless_api_key}"
-    response = requests.post(post_url, headers=headers, data=data_json)
+    post_url = f"https://chrome.browserless.io/content?token={browserless_api_key}"
 
-    # Check the response status code
-    if response.status_code == 200:
-        soup = BeautifulSoup(response.content, "html.parser")
-        text = soup.get_text()
-        print("CONTENTTTTTT:", text)
+    try:
+        response = requests.post(post_url, headers=headers, data=data_json, timeout=10)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        logging.error("Scrape request failed: %s", e)
+        return f"Scrape request failed: {e}"
 
-        if len(text) > 10000:
-            output = summary(objective, text)
-            return output
-        else:
-            return text
-    else:
-        print(f"HTTP request failed with status code {response.status_code}")
+    soup = BeautifulSoup(response.content, "html.parser")
+    text = soup.get_text()
+
+    if len(text) > 10000:
+        output = summary(objective, text)
+        return output
+    return text
 
 
 def summary(objective, content):
@@ -125,8 +131,9 @@ class ScrapeWebsiteTool(BaseTool):
     def _run(self, objective: str, url: str):
         return scrape_website(objective, url)
 
-    def _arun(self, url: str):
-        raise NotImplementedError("error here")
+    async def _arun(self, objective: str, url: str):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, scrape_website, objective, url)
 
 
 # 3. Create langchain agent with the tools above
@@ -157,37 +164,25 @@ agent_kwargs = {
     "system_message": system_message,
 }
 
-llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo-16k-0613")
-memory = ConversationSummaryBufferMemory(
-    memory_key="memory", return_messages=True, llm=llm, max_token_limit=1000)
+if not TESTING:
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo-16k-0613")
+    memory = ConversationSummaryBufferMemory(
+        memory_key="memory", return_messages=True, llm=llm, max_token_limit=1000
+    )
 
-agent = initialize_agent(
-    tools,
-    llm,
-    agent=AgentType.OPENAI_FUNCTIONS,
-    verbose=True,
-    agent_kwargs=agent_kwargs,
-    memory=memory,
-)
+    agent = initialize_agent(
+        tools,
+        llm,
+        agent=AgentType.OPENAI_FUNCTIONS,
+        verbose=True,
+        agent_kwargs=agent_kwargs,
+        memory=memory,
+    )
+else:
+    llm = None
+    memory = None
+    agent = lambda *args, **kwargs: {"output": ""}
 
-
-# 4. Use streamlit to create a web app
-# def main():
-#     st.set_page_config(page_title="AI research agent", page_icon=":bird:")
-
-#     st.header("AI research agent :bird:")
-#     query = st.text_input("Research goal")
-
-#     if query:
-#         st.write("Doing research for ", query)
-
-#         result = agent({"input": query})
-
-#         st.info(result['output'])
-
-
-# if __name__ == '__main__':
-#     main()
 
 
 # 5. Set this as an API endpoint via FastAPI
@@ -199,8 +194,6 @@ class Query(BaseModel):
 
 
 @app.post("/")
-def researchAgent(query: Query):
-    query = query.query
-    content = agent({"input": query})
-    actual_content = content['output']
-    return actual_content
+async def researchAgent(query: Query):
+    result = await run_in_threadpool(agent, {"input": query.query})
+    return result["output"]
